@@ -1,12 +1,14 @@
+# main.py
 import asyncio
 import re
 import aiohttp
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
-import os
+from pathlib import Path
 
 # --- Modelos de Dados ---
 class UrlList(BaseModel):
@@ -14,6 +16,9 @@ class UrlList(BaseModel):
 
 # --- Configuração do FastAPI ---
 app = FastAPI()
+
+# --- CORREÇÃO: Procura o index.html na mesma pasta (diretório ".") do main.py ---
+templates = Jinja2Templates(directory=".")
 
 # --- Lógica de Extração ---
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
@@ -36,8 +41,13 @@ def _collect_data_from_erome(soup: BeautifulSoup) -> tuple[str, list]:
             source_tag = item_container.find("source")
             if source_tag and 'src' in source_tag.attrs:
                 video_url = source_tag['src']
+            poster_div = item_container.find("div", class_="vjs-poster") # Procuramos em relação ao container do item
+            if poster_div and 'style' in poster_div.attrs:
+                match = re.search(r'url\("?(.+?)"?\)', poster_div['style'])
+                if match:
+                    thumb_url = match.group(1)
             if video_url:
-                media_items.append({"type": "video", "media_url": video_url, "thumb_url": ""})
+                media_items.append({"type": "video", "media_url": video_url, "thumb_url": thumb_url})
         else:
             image_tag = item_container.find("img", class_="img-back")
             if image_tag:
@@ -51,7 +61,8 @@ def _collect_data_from_imagepond(soup: BeautifulSoup) -> tuple[str, list]:
     video_tag = soup.find("meta", property="og:video")
     thumb_tag = soup.find("meta", property="og:image")
     if video_tag and thumb_tag:
-        video_url, thumb_url = video_tag.get('content'), thumb_tag.get('content')
+        video_url = video_tag.get('content')
+        thumb_url = thumb_tag.get('content')
         if video_url and thumb_url:
             media_items.append({"type": "video", "media_url": video_url, "thumb_url": thumb_url})
     return title, media_items
@@ -71,6 +82,10 @@ async def process_single_url(session, url):
         async with session.get(url) as response:
             response.raise_for_status()
             html_content = await response.text()
+            
+            # --- ADIÇÃO PARA DEBUG: Imprime o início do HTML nos logs do servidor ---
+            print(f"--- HTML recebido de {url} ---\n{html_content[:2000]}\n--- FIM DO DEBUG ---")
+            
             soup = BeautifulSoup(html_content, "html.parser")
             title, items = parser_func(soup)
             return {"status": "success", "url": url, "title": title, "items": items}
@@ -80,10 +95,8 @@ async def process_single_url(session, url):
 # --- Endpoints da API ---
 
 @app.get("/", response_class=HTMLResponse)
-async def read_root():
-    """Carrega o index.html que está na raiz do projeto"""
-    index_path = os.path.join(os.path.dirname(__file__), "index.html")
-    return FileResponse(index_path)
+async def read_root(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
 
 @app.post("/extract")
 async def extract_links(data: UrlList):
@@ -92,4 +105,5 @@ async def extract_links(data: UrlList):
     async with aiohttp.ClientSession(headers=headers) as session:
         tasks = [process_single_url(session, url) for url in data.urls]
         results = await asyncio.gather(*tasks)
+    
     return {"results": results}
